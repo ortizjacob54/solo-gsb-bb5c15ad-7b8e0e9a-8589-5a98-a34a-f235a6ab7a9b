@@ -50,6 +50,10 @@ class InvalidBudgetError(Exception):
     """漂移预算不是正数。"""
 
 
+class InvalidSpreadError(Exception):
+    """稳定窗口允许的最大偏差极差不是正数。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -668,3 +672,50 @@ def drift_budget_depletion(frm: float, budget: float) -> dict:
             "coverage_end_iso": epoch_to_iso(hi),
             "contributions": contributions,
         }
+
+
+# ---------- 最长稳定窗口分析 ----------
+
+def drift_stability_window(frm: float, to: float, max_spread: float) -> dict:
+    """在窗口 [frm, to] 内解析求 max(bias)−min(bias) ≤ max_spread 的最长连续子区间。
+
+    最优边界可落在插值段内部：单段窗口按 |斜率|·时长解析截取，跨段窗口把
+    段内可行 (u,v) 参数集写成线性约束交出的凸多边形，线性目标（时长）极值
+    必在多边形顶点，由约束直线解析交点精确定位（见
+    calibration.longest_stability_window），全程无固定步长采样。并列时长
+    返回起点最早者。
+    """
+    if not frm < to:
+        raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
+    if not max_spread > 0:  # 同时拒绝 NaN
+        raise InvalidSpreadError(f"max_spread ({max_spread}) must be positive")
+    with closing(connect()) as conn:
+        bounds = conn.execute("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM observations").fetchone()
+        lo, hi = bounds["lo"], bounds["hi"]
+        if lo is None:
+            raise OutOfCoverageError(frm, None, None)
+        if frm < lo:
+            raise OutOfCoverageError(frm, lo, hi)
+        if to > hi:
+            raise OutOfCoverageError(to, lo, hi)
+        rows = conn.execute(
+            "SELECT ts, bias FROM observations WHERE ts >= ? AND ts <= ? ORDER BY ts",
+            (lo, hi),
+        ).fetchall()
+        nodes = [(r["ts"], r["bias"]) for r in rows]
+    result = calibration.longest_stability_window(nodes, frm, to, max_spread)
+    s, e = result["t_start"], result["t_end"]
+    return {
+        "from": frm,
+        "from_iso": epoch_to_iso(frm),
+        "to": to,
+        "to_iso": epoch_to_iso(to),
+        "max_spread": max_spread,
+        "window_start": s,
+        "window_start_iso": epoch_to_iso(s),
+        "window_end": e,
+        "window_end_iso": epoch_to_iso(e),
+        "duration_seconds": result["duration_seconds"],
+        "min_bias": result["min_bias"],
+        "max_bias": result["max_bias"],
+    }

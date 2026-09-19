@@ -15,6 +15,7 @@ from .models import (
     DriftBudgetDepletionOut,
     DriftExceedancesOut,
     DriftIntegralOut,
+    DriftStabilityWindowOut,
     HistoricalCorrectionOut,
     IntervalOut,
     ObservationIn,
@@ -27,6 +28,7 @@ from .service import (
     DuplicateTimestampError,
     InvalidBudgetError,
     InvalidLimitError,
+    InvalidSpreadError,
     InvalidWindowError,
     ObservationNotFoundError,
     OutOfCoverageError,
@@ -197,4 +199,26 @@ def get_drift_budget_depletion(
     try:
         return service.drift_budget_depletion(frm=from_, budget=budget)
     except (InvalidBudgetError, OutOfCoverageError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/drift-stability-window", response_model=DriftStabilityWindowOut)
+def get_drift_stability_window(
+    from_: Annotated[Timestamp, Query(alias="from", description="查询窗口下界：Unix 秒或 ISO 8601")],
+    to: Annotated[Timestamp, Query(description="查询窗口上界：Unix 秒或 ISO 8601")],
+    max_spread: Annotated[
+        float, Query(description="允许的最大偏差极差（正数）：max(bias)−min(bias) ≤ 该值")
+    ],
+) -> dict:
+    """在查询范围内解析求偏差极差不超过 max_spread 的最长连续子区间。
+
+    最优边界可落在插值段内部：单段窗口按线性斜率解析截取，跨段窗口的可行
+    (u,v) 参数集是线性约束交出的凸多边形，最长点在约束直线解析交点处取得，
+    全程无固定步长采样。返回起止时刻（Unix 秒与 ISO 8601）、duration_seconds
+    及窗口内 min_bias/max_bias；并列持续时长返回起点最早者。from ≥ to、
+    max_spread ≤ 0 或窗口边界越出覆盖范围均返回 400。
+    """
+    try:
+        return service.drift_stability_window(frm=from_, to=to, max_spread=max_spread)
+    except (InvalidWindowError, InvalidSpreadError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -866,3 +866,157 @@ def test_drift_budget_depletion_rejects_non_positive_budget(two_points):
 def test_drift_budget_depletion_without_any_observation_rejected(client):
     resp = client.get("/drift-budget-depletion", params={"from": 1000.0, "budget": 100.0})
     assert resp.status_code == 400
+
+
+# ---------- 最长稳定窗口分析 ----------
+
+@pytest.fixture()
+def stability_points(client):
+    # bias：1000 → 1.0，2000 → 3.0，3000 → -1.0
+    make_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9, 20.0])
+    make_observation(client, 2000.0, 10.0, 0.5, [7.0, 7.1, 6.9])
+    make_observation(client, 3000.0, 10.0, 0.5, [11.0, 11.1, 10.9])
+    return client
+
+
+def test_drift_stability_window_within_single_interval(stability_points):
+    # 段1 bias 1 → 3，max_spread 1：最长 500s，并列取起点最早 → [1000, 1500]
+    resp = stability_points.get(
+        "/drift-stability-window", params={"from": 1000.0, "to": 2000.0, "max_spread": 1.0}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["from"] == pytest.approx(1000.0)
+    assert body["to"] == pytest.approx(2000.0)
+    assert body["max_spread"] == pytest.approx(1.0)
+    assert body["window_start"] == pytest.approx(1000.0)
+    assert body["window_end"] == pytest.approx(1500.0)
+    assert body["duration_seconds"] == pytest.approx(500.0)
+    assert body["min_bias"] == pytest.approx(1.0)
+    assert body["max_bias"] == pytest.approx(2.0)
+    assert body["window_start_iso"].startswith("1970-01-01T00:16:40")
+    assert body["window_end_iso"].startswith("1970-01-01T00:25:00")
+
+
+def test_drift_stability_window_full_range_when_spread_covers(stability_points):
+    # 全程极差 1 → -1 之间为 4（峰值 3 在 t=2000）：spread 4 覆盖整个窗口
+    body = stability_points.get(
+        "/drift-stability-window", params={"from": 1000.0, "to": 3000.0, "max_spread": 4.0}
+    ).json()
+    assert body["window_start"] == pytest.approx(1000.0)
+    assert body["window_end"] == pytest.approx(3000.0)
+    assert body["duration_seconds"] == pytest.approx(2000.0)
+    assert body["min_bias"] == pytest.approx(-1.0)
+    assert body["max_bias"] == pytest.approx(3.0)
+
+
+def test_drift_stability_window_clips_query_bounds_inside_intervals(stability_points):
+    # 窗口 [1250, 2750]：裁剪后折线 bias 1.5 → 3 → -0.5
+    # spread 2：[1250, 2500]（起点 bias 1.5，经峰值 3，终点 bias 1.0），极差恰为 2
+    body = stability_points.get(
+        "/drift-stability-window", params={"from": 1250.0, "to": 2750.0, "max_spread": 2.0}
+    ).json()
+    assert body["window_start"] == pytest.approx(1250.0)
+    assert body["window_end"] == pytest.approx(2500.0)
+    assert body["duration_seconds"] == pytest.approx(1250.0)
+    assert body["min_bias"] == pytest.approx(1.0)
+    assert body["max_bias"] == pytest.approx(3.0)
+
+
+def test_drift_stability_window_boundaries_via_analytic_intersection(client):
+    # bias：0 → 3 → 0（尖峰），spread 2：跨尖峰窗口两端均为解析交点
+    # 含峰值 3 时两端 bias 必须 ≥ 1：上升段 bias=1 在 t=1333.333...，下降段在 t=2666.666...
+    make_observation(client, 1000.0, 10.0, 0.5, [10.0, 10.1, 9.9])   # bias 0.0
+    make_observation(client, 2000.0, 10.0, 0.5, [7.0, 7.1, 6.9])     # bias 3.0
+    make_observation(client, 3000.0, 10.0, 0.5, [10.0, 10.1, 9.9])   # bias 0.0
+    body = client.get(
+        "/drift-stability-window", params={"from": 1000.0, "to": 3000.0, "max_spread": 2.0}
+    ).json()
+    assert body["window_start"] == pytest.approx(1000.0 + 1000.0 / 3.0)
+    assert body["window_end"] == pytest.approx(3000.0 - 1000.0 / 3.0)
+    assert body["duration_seconds"] == pytest.approx(4000.0 / 3.0)
+    assert body["min_bias"] == pytest.approx(1.0)
+    assert body["max_bias"] == pytest.approx(3.0)
+
+
+def test_drift_stability_window_tie_prefers_earliest_start(client):
+    # 对称 V：bias 1 → -3 → 1，spread 2。
+    # 最优窗口 1000s，两侧各有无穷多个并列；起点最早者为 t=1500（bias 0）→ t=2500（bias -1）
+    make_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9])     # bias 1.0
+    make_observation(client, 2000.0, 10.0, 0.5, [13.0, 13.1, 12.9])  # bias -3.0
+    make_observation(client, 3000.0, 10.0, 0.5, [9.0, 9.1, 8.9])     # bias 1.0
+    body = client.get(
+        "/drift-stability-window", params={"from": 1000.0, "to": 3000.0, "max_spread": 2.0}
+    ).json()
+    assert body["window_start"] == pytest.approx(1500.0)
+    assert body["window_end"] == pytest.approx(2500.0)
+    assert body["duration_seconds"] == pytest.approx(1000.0)
+    assert body["min_bias"] == pytest.approx(-3.0)
+    assert body["max_bias"] == pytest.approx(-1.0)
+
+
+def test_drift_stability_window_constant_bias(client):
+    make_observation(client, 1000.0, 10.0, 0.5, [8.0, 8.1, 7.9])   # bias 2.0
+    make_observation(client, 2000.0, 10.0, 0.5, [8.0, 8.1, 7.9])   # bias 2.0
+    body = client.get(
+        "/drift-stability-window", params={"from": 1250.0, "to": 1750.0, "max_spread": 0.1}
+    ).json()
+    assert body["window_start"] == pytest.approx(1250.0)
+    assert body["window_end"] == pytest.approx(1750.0)
+    assert body["duration_seconds"] == pytest.approx(500.0)
+    assert body["min_bias"] == pytest.approx(2.0)
+    assert body["max_bias"] == pytest.approx(2.0)
+
+
+def test_drift_stability_window_accepts_iso8601_bounds(stability_points):
+    resp = stability_points.get(
+        "/drift-stability-window",
+        params={
+            "from": "1970-01-01T00:16:40Z",
+            "to": "1970-01-01T00:33:20Z",
+            "max_spread": 1.0,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["window_start"] == pytest.approx(1000.0)
+    assert body["window_end"] == pytest.approx(1500.0)
+    assert body["duration_seconds"] == pytest.approx(500.0)
+
+
+def test_drift_stability_window_rejects_inverted_or_empty_window(stability_points):
+    for params in (
+        {"from": 2000.0, "to": 2000.0, "max_spread": 1.0},
+        {"from": 3000.0, "to": 1000.0, "max_spread": 1.0},
+    ):
+        resp = stability_points.get("/drift-stability-window", params=params)
+        assert resp.status_code == 400
+        assert "must be less than" in resp.json()["detail"]
+
+
+def test_drift_stability_window_rejects_non_positive_spread(stability_points):
+    for spread in (0.0, -1.0):
+        resp = stability_points.get(
+            "/drift-stability-window",
+            params={"from": 1000.0, "to": 3000.0, "max_spread": spread},
+        )
+        assert resp.status_code == 400
+        assert "must be positive" in resp.json()["detail"]
+
+
+def test_drift_stability_window_out_of_coverage_rejected(stability_points):
+    for params in (
+        {"from": 999.0, "to": 2000.0, "max_spread": 1.0},
+        {"from": 2000.0, "to": 3001.0, "max_spread": 1.0},
+    ):
+        resp = stability_points.get("/drift-stability-window", params=params)
+        assert resp.status_code == 400
+        assert "outside calibration coverage" in resp.json()["detail"]
+
+
+def test_drift_stability_window_without_any_observation_rejected(client):
+    resp = client.get(
+        "/drift-stability-window",
+        params={"from": 1.0, "to": 2.0, "max_spread": 1.0},
+    )
+    assert resp.status_code == 400
