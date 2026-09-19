@@ -50,6 +50,10 @@ class InvalidBudgetError(Exception):
     """漂移预算不是正数。"""
 
 
+class InvalidSpreadError(Exception):
+    """稳定窗口允许的最大波动幅度不是正数。"""
+
+
 # ---------- 观测 ----------
 
 def create_observation(reference: float, tolerance: float, readings: list[float], ts: float) -> dict:
@@ -667,4 +671,61 @@ def drift_budget_depletion(frm: float, budget: float) -> dict:
             "coverage_end": hi,
             "coverage_end_iso": epoch_to_iso(hi),
             "contributions": contributions,
+        }
+
+
+# ---------- 漂移稳定窗口分析 ----------
+
+def drift_stability_window(frm: float, to: float, max_spread: float) -> dict:
+    """在窗口 [frm, to] 内求 max(bias) − min(bias) ≤ max_spread 的最长连续子区间。
+
+    把裁剪到查询窗口的分段线性 bias（窗口端点按插值补齐为折点）交给纯函数
+    calibration.stability_window 解析求解：最优窗口必是某临界带宽
+    [m, m+max_spread] 的连通分量（m 取遍折点取值及其下移 max_spread 的值），
+    分量边界由线性段与带宽边缘的解析交点精确定位，不做固定步长采样；
+    时长并列时取起点最早者。
+    """
+    if not frm < to:
+        raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
+    if not max_spread > 0:  # 同时拒绝 NaN
+        raise InvalidSpreadError(f"max_spread ({max_spread}) must be positive")
+    with closing(connect()) as conn:
+        bounds = conn.execute("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM observations").fetchone()
+        lo, hi = bounds["lo"], bounds["hi"]
+        if lo is None:
+            raise OutOfCoverageError(frm, None, None)
+        if frm < lo:
+            raise OutOfCoverageError(frm, lo, hi)
+        if to > hi:
+            raise OutOfCoverageError(to, lo, hi)
+        rows = conn.execute(
+            "SELECT * FROM intervals WHERE t_start < ? AND t_end > ? ORDER BY t_start",
+            (to, frm),
+        ).fetchall()
+        # 裁剪到查询窗口的分段线性折点：相邻区间在共享折点处相接
+        points: list[tuple[float, float]] = []
+        for row in rows:
+            a = max(frm, row["t_start"])   # 裁剪到查询窗口
+            b = min(to, row["t_end"])
+            if not a < b:
+                continue                   # 仅在端点相触，时长为零
+            ba = calibration.interpolate(a, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
+            bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
+            if not points:
+                points.append((a, ba))
+            points.append((b, bb))
+        s, e, min_bias, max_bias = calibration.stability_window(points, max_spread)
+        return {
+            "from": frm,
+            "from_iso": epoch_to_iso(frm),
+            "to": to,
+            "to_iso": epoch_to_iso(to),
+            "max_spread": max_spread,
+            "t_start": s,
+            "t_end": e,
+            "start_iso": epoch_to_iso(s),
+            "end_iso": epoch_to_iso(e),
+            "duration_seconds": e - s,
+            "min_bias": min_bias,
+            "max_bias": max_bias,
         }

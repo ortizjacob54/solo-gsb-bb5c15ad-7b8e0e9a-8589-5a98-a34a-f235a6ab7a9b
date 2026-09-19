@@ -207,3 +207,18 @@ class DriftBudgetDepletionOut(BaseModel):
         description="按插值区间裁剪到 [from, 耗尽点或覆盖终点] 的分段消耗，按时间排序；"
         "各段 absolute_bias_seconds 之和等于 consumed"
     )
+
+
+class DriftStabilityWindowOut(BaseModel):
+    from_: float = Field(alias="from", description="分析窗口下界（Unix 秒）")
+    from_iso: str
+    to: float = Field(description="分析窗口上界（Unix 秒）")
+    to_iso: str
+    max_spread: float = Field(description="允许的最大波动幅度（正数）：窗口内 max(bias) − min(bias) ≤ max_spread")
+    t_start: float = Field(description="最长稳定子区间起点（Unix 秒）：解析交点或窗口边界")
+    t_end: float = Field(description="最长稳定子区间终点（Unix 秒）：解析交点或窗口边界")
+    start_iso: str
+    end_iso: str
+    duration_seconds: float = Field(description="稳定持续秒数（t_end − t_start）")
+    min_bias: float = Field(description="子区间内 bias 实际达到的最小值")
+    max_bias: float = Field(description="子区间内 bias 实际达到的最大值")

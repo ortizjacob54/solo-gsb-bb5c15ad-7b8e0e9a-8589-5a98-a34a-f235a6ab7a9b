@@ -26,7 +26,8 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 8. **累计漂移量**：`GET /drift-integral?from=&to=` 在覆盖范围内对当前分段线性 `bias` 做**解析积分**（精确梯形面积；段内 `bias` 过零时按解析交点拆分绝对值面积，不做固定步长采样），返回 `signed_bias_seconds`、`absolute_bias_seconds` 及按插值区间裁剪后的分段 `contributions`。窗口边界可落在区间内部；`from` 必须小于 `to`，任一边界越界返回 400。
 9. **漂移超限窗口分析**：`GET /drift-exceedances?from=&to=&limit=` 在覆盖范围内**解析求解**分段线性 `bias` 与 `±limit` 的交点（不做固定步长采样），返回 `|bias| > limit` 的连续区间，每段含方向（`high`/`low`）、持续秒数与区间内峰值绝对偏差；跨观测点仍连续且同向的片段合并为一段，恰等于阈值的瞬时不计入超限（观测点恰好触及阈值时两侧不合并）。`from` 必须小于 `to`、`limit` 必须为正数，任一边界越界返回 400。
 10. **漂移预算耗尽分析**：`GET /drift-budget-depletion?from=&budget=` 从 `from` 起沿当前分段线性 `bias` 累积 `|bias|·秒`，**解析求出**预算首次耗尽的精确时点：段内 `bias` 过零时先在解析零点拆分（`|bias|` 仅在拆分后的子段上才是线性函数），目标面积落入某子段时反解其累积二次式，不做固定步长采样。返回 `depleted_at`（覆盖范围内未耗尽为 `null`）、截至耗尽点（未耗尽时为覆盖终点）的 `consumed`/`remaining`，以及按插值区间裁剪的分段 `contributions`。`budget` 必须为正数，`from` 越出覆盖范围返回 400。
-11. **历史时点漂移补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 按 `as_of` 系统时点重建校准状态后，对目标观测时点 `effective_at` 的读数做漂移补偿。重建依据 `observations.created_at`、当前版本与 `revisions` 快照：`created_at > as_of` 的观测尚未创建、不参与；修订自 `changed_at` 起生效（恰等于 `changed_at` 时使用新版本），`changed_at > as_of` 的修订一律回滚到快照旧值。随后按重建出的观测时点排序，沿用与 `/corrections` 相同的覆盖范围与线性插值规则。查询**只读**，不改写当前观测、修订历史或区间表；响应附带 `as_of` 及所用端点的观测 ID 与版本。
+11. **漂移稳定窗口分析**：`GET /drift-stability-window?from=&to=&max_spread=` 在覆盖范围内**解析求出** `max(bias) − min(bias) ≤ max_spread` 的持续时间最长的连续子区间：最优窗口必是某临界带宽 `[m, m+max_spread]` 的连通分量（`m` 取遍折点取值及其下移 `max_spread` 的值），分量边界由线性段与带宽边缘的解析交点精确定位，可落在插值段内部，不做固定步长采样；时长并列时返回起点最早者。响应含起止时刻、`duration_seconds` 与窗口内实际达到的 `min_bias`/`max_bias`。`from` 必须小于 `to`、`max_spread` 必须为正数，任一边界越界返回 400。
+12. **历史时点漂移补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 按 `as_of` 系统时点重建校准状态后，对目标观测时点 `effective_at` 的读数做漂移补偿。重建依据 `observations.created_at`、当前版本与 `revisions` 快照：`created_at > as_of` 的观测尚未创建、不参与；修订自 `changed_at` 起生效（恰等于 `changed_at` 时使用新版本），`changed_at > as_of` 的修订一律回滚到快照旧值。随后按重建出的观测时点排序，沿用与 `/corrections` 相同的覆盖范围与线性插值规则。查询**只读**，不改写当前观测、修订历史或区间表；响应附带 `as_of` 及所用端点的观测 ID 与版本。
 
 ## API 一览
 
@@ -42,6 +43,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 | GET | `/drift-integral` | 对覆盖范围内分段线性偏差做精确积分（累计漂移量） |
 | GET | `/drift-exceedances` | 解析求解偏差越出 ±limit 的连续区间（方向/持续秒数/峰值） |
 | GET | `/drift-budget-depletion` | 解析求解漂移预算（\|bias\|·秒）首次耗尽的精确时点 |
+| GET | `/drift-stability-window` | 解析求解 max(bias) − min(bias) ≤ max_spread 的最长连续稳定子区间 |
 | GET | `/health` | 健康检查 |
 
 时间戳支持 Unix 秒（数字）或 ISO 8601 字符串（如 `2026-09-18T08:00:00Z`），缺省为服务器当前时间。
@@ -290,11 +292,35 @@ curl "http://localhost:8000/drift-budget-depletion?from=2026-09-18T08:00:00Z&bud
 
 预算未在覆盖范围内耗尽时 `depleted_at` 为 `null`，`consumed` 为到覆盖终点的全部累计量、`remaining` 为剩余预算；`contributions` 按插值区间裁剪到 `[from, 耗尽点或覆盖终点]`，各段 `absolute_bias_seconds` 之和即 `consumed`。`budget ≤ 0` 或 `from` 越出覆盖范围返回 400。
 
+### 漂移稳定窗口分析
+
+`GET /drift-stability-window?from=&to=&max_spread=` 在 `[from, to]` 内解析求出 `max(bias) − min(bias) ≤ max_spread` 的持续时间最长的连续子区间。最优窗口必是某临界带宽 `[m, m+max_spread]` 的连通分量——`m` 只需取遍各折点取值 `b_i` 与 `b_i − max_spread`（带宽边缘未触及折点取值时，微调 `m` 可让分量至少一端继续外伸、时长严格增大）；分量边界由线性段与带宽边缘的**解析交点**精确定位，可落在插值段内部，全程无固定步长采样。时长并列时返回起点最早者。
+
+沿用上文观测（08:00 `bias 1.0` → 10:00 `bias 3.0` → 12:00 `bias −3.0`），允许波动 `max_spread=2.0` 时，最长稳定窗口为 08:00–10:40（`bias` 1.0 → 3.0 → 1.0，波动恰为 2.0，右端点是 `bias` 回落至 1.0 的解析交点）：
+
+```bash
+curl "http://localhost:8000/drift-stability-window?from=2026-09-18T08:00:00Z&to=2026-09-18T12:00:00Z&max_spread=2.0"
+```
+
+```json
+{
+  "from": 1789718400.0, "from_iso": "2026-09-18T08:00:00+00:00",
+  "to": 1789732800.0, "to_iso": "2026-09-18T12:00:00+00:00",
+  "max_spread": 2.0,
+  "t_start": 1789718400.0, "t_end": 1789728000.0,
+  "start_iso": "2026-09-18T08:00:00+00:00", "end_iso": "2026-09-18T10:40:00+00:00",
+  "duration_seconds": 9600.0,
+  "min_bias": 1.0, "max_bias": 3.0
+}
+```
+
+`min_bias`/`max_bias` 为窗口内实际达到的极值（可能小于 `max_spread` 所允许的带宽）；`from ≥ to`、`max_spread ≤ 0` 或窗口边界越出覆盖范围均返回 400。
+
 ### 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0` |
+| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0` |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
 | 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用 |
 | 422 | 读数不足 3 次、全部读数被判异常、参数非法 |
@@ -314,8 +340,8 @@ uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 ```
 app/
   main.py         # FastAPI 路由
-  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析
-  calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解
+  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析
+  calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解、稳定窗口求解
   models.py       # Pydantic 请求/响应模型
   db.py           # SQLite 连接与建表
 tests/test_api.py # 端到端 API 测试

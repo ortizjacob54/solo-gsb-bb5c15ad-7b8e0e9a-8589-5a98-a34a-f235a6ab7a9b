@@ -15,6 +15,7 @@ from .models import (
     DriftBudgetDepletionOut,
     DriftExceedancesOut,
     DriftIntegralOut,
+    DriftStabilityWindowOut,
     HistoricalCorrectionOut,
     IntervalOut,
     ObservationIn,
@@ -27,6 +28,7 @@ from .service import (
     DuplicateTimestampError,
     InvalidBudgetError,
     InvalidLimitError,
+    InvalidSpreadError,
     InvalidWindowError,
     ObservationNotFoundError,
     OutOfCoverageError,
@@ -197,4 +199,24 @@ def get_drift_budget_depletion(
     try:
         return service.drift_budget_depletion(frm=from_, budget=budget)
     except (InvalidBudgetError, OutOfCoverageError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/drift-stability-window", response_model=DriftStabilityWindowOut)
+def get_drift_stability_window(
+    from_: Annotated[Timestamp, Query(alias="from", description="分析窗口下界：Unix 秒或 ISO 8601")],
+    to: Annotated[Timestamp, Query(description="分析窗口上界：Unix 秒或 ISO 8601")],
+    max_spread: Annotated[float, Query(description="允许的最大波动幅度（正数）：窗口内 max(bias) − min(bias) 不超过该值")],
+) -> dict:
+    """在观测覆盖范围内解析求出 max(bias) − min(bias) ≤ max_spread 的最长连续子区间。
+
+    最优窗口必是某临界带宽 [m, m+max_spread] 的连通分量（m 取遍折点取值及其下移
+    max_spread 的值），分量边界由线性段与带宽边缘的解析交点精确定位，可落在插值
+    段内部，不做固定步长采样；时长并列时返回起点最早者。响应含起止时刻、
+    duration_seconds 与窗口内实际达到的 min_bias/max_bias。from ≥ to、
+    max_spread ≤ 0 或窗口边界越出覆盖范围均返回 400。
+    """
+    try:
+        return service.drift_stability_window(frm=from_, to=to, max_spread=max_spread)
+    except (InvalidWindowError, InvalidSpreadError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

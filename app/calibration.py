@@ -1,4 +1,4 @@
-"""纯计算逻辑：异常判定、校准偏差、线性插值、分段线性积分、超限区间求解与预算累积反解。不触碰数据库，便于单测。"""
+"""纯计算逻辑：异常判定、校准偏差、线性插值、分段线性积分、超限区间求解、预算累积反解与稳定窗口求解。不触碰数据库，便于单测。"""
 from __future__ import annotations
 
 import math
@@ -132,3 +132,94 @@ def exceedance_subranges(t0: float, b0: float, t1: float, b1: float, limit: floa
         out.append((low[0], low[1], "low"))
     out.sort(key=lambda r: r[0])  # 同一段内高低两段不重叠，按起点排即时间序
     return out
+
+
+# ---------- 最长稳定窗口（max−min ≤ spread） ----------
+
+def _clip_to_band(t0: float, b0: float, t1: float, b1: float, lo: float, hi: float) -> tuple[float, float] | None:
+    """线性段 (t0,b0)-(t1,b1) 上 lo ≤ b ≤ hi 的子区间 (u, v)；完全在带外则 None。
+
+    端点落在带内时 u/v 直接取精确的端点时刻；仅当边界严格穿过带宽时才计算解析
+    交点 t* = t0 + (level − b0)·Δt/(b1 − b0)。这样相邻段在带内折点处的拼接是
+    精确的（不受除法舍入误差影响），全程解析解，不做固定步长采样。
+    """
+    in0 = lo <= b0 <= hi
+    in1 = lo <= b1 <= hi
+    if in0 and in1:
+        return t0, t1
+    if b0 == b1:  # 恒定且在带外
+        return None
+    k = (b1 - b0) / (t1 - t0)
+    t_lo = t0 + (lo - b0) / k   # b = lo 的解析交点
+    t_hi = t0 + (hi - b0) / k   # b = hi 的解析交点
+    enter, leave = (t_lo, t_hi) if k > 0 else (t_hi, t_lo)
+    u = t0 if in0 else max(t0, enter)
+    v = t1 if in1 else min(t1, leave)
+    if u > v:
+        return None
+    return u, v
+
+
+def _band_components(points: list[tuple[float, float]], lo: float, hi: float):
+    """产出 {t : lo ≤ b(t) ≤ hi} 的各连通分量 (s, e)，按时间排序。
+
+    相邻线性段在共享折点处同属带宽时合并为同一分量；仅在折点处相触也算相连
+    （该瞬时时长为零，窗口经过该点不影响 max−min ≤ spread 的成立）。
+    """
+    cur_s = cur_e = None
+    for (t0, b0), (t1, b1) in zip(points, points[1:]):
+        clip = _clip_to_band(t0, b0, t1, b1, lo, hi)
+        if clip is None:
+            if cur_s is not None:
+                yield cur_s, cur_e
+                cur_s = cur_e = None
+            continue
+        u, v = clip
+        if cur_e is not None and u == cur_e:
+            cur_e = v                      # 与上一段在折点处相接：延伸当前分量
+        else:
+            if cur_s is not None:
+                yield cur_s, cur_e
+            cur_s, cur_e = u, v
+    if cur_s is not None:
+        yield cur_s, cur_e
+
+
+def _value_at(points: list[tuple[float, float]], t: float) -> float:
+    """分段线性函数在 t 处的取值（t 须在 points 覆盖范围内）。"""
+    for (t0, b0), (t1, b1) in zip(points, points[1:]):
+        if t0 <= t <= t1:
+            return interpolate(t, t0, b0, t1, b1)
+    return points[-1][1]
+
+
+def _is_better(duration: float, s: float, best_duration: float, best_s: float) -> bool:
+    """候选窗口是否优于当前最优：时长更长；时长并列（含浮点噪声）时取起点更早者。"""
+    tol = 1e-9 * max(1.0, abs(duration), abs(best_duration))
+    if duration > best_duration + tol:
+        return True
+    return abs(duration - best_duration) <= tol and s < best_s
+
+
+def stability_window(points: list[tuple[float, float]], spread: float) -> tuple[float, float, float, float]:
+    """求分段线性 bias 上 max(bias) − min(bias) ≤ spread 的最长连续子区间。
+
+    points 为按时间升序的折点 [(t, b)]（含裁剪后的查询窗口端点）。最优窗口必为
+    某临界带宽 [m, m+spread] 的连通分量：带宽边缘未触及任何折点取值时，微调 m
+    可让分量至少一端继续外伸、时长严格增大（或平移到更早的起点），故只需枚举
+    m 取遍折点取值 b_i 与 b_i − spread。分量边界由线性段与 m / m+spread 的解析
+    交点定位，不做固定步长采样。返回 (s, e, min_bias, max_bias)，其中
+    min_bias/max_bias 为窗口内实际达到的极值；时长并列时取起点最早者。
+    """
+    values = [b for _, b in points]
+    candidates = sorted({*values, *(v - spread for v in values)})
+    best_duration = best_s = best_e = None
+    for m in candidates:
+        for s, e in _band_components(points, m, m + spread):
+            duration = e - s
+            if best_duration is None or _is_better(duration, s, best_duration, best_s):
+                best_duration, best_s, best_e = duration, s, e
+    s, e = best_s, best_e
+    extrema = [_value_at(points, s), _value_at(points, e)]
+    extrema += [b for t, b in points if s < t < e]
+    return s, e, min(extrema), max(extrema)
